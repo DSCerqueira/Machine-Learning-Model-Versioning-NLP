@@ -41,8 +41,8 @@ REPORTS = WORKSPACE / "reports"
 STATE_PATH = WORKSPACE / "state.json"
 
 PSI_THRESHOLD = float(os.getenv("PSI_THRESHOLD", "0.20"))
-MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-GRAFANA_URL = os.getenv("GRAFANA_URL", "http://localhost:3000")
+MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
+GRAFANA_URL = os.getenv("GRAFANA_URL", "http://grafana:3000")
 GRAFANA_USER = os.getenv("GRAFANA_USER", "admin")
 GRAFANA_PASSWORD = os.getenv("GRAFANA_PASSWORD", "admin")
 GRAFANA_BROWSER_URL = os.getenv("GRAFANA_BROWSER_URL", "http://localhost:3000")
@@ -430,6 +430,8 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
 
     validation_predictions = grid_search.best_estimator_.predict(X_validation)
     validation_accuracy = float(accuracy_score(y_validation, validation_predictions))
+
+    print("Validation Accutacy: ",validation_accuracy)
 
     # Refit the selected configuration on train + validation, leaving test untouched.
     X_train_final = pd.concat([X_train, X_validation])
