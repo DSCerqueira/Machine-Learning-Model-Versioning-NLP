@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pandas
+numpy
+scipy
+scikit-learn
+joblib
+mlflow==2.17.2
+prometheus-client
+requests
+nltk
+huggingface_hub==1.28.0
+fsspec
