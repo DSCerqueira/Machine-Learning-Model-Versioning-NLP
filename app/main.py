@@ -41,11 +41,17 @@ REPORTS = WORKSPACE / "reports"
 STATE_PATH = WORKSPACE / "state.json"
 
 PSI_THRESHOLD = float(os.getenv("PSI_THRESHOLD", "0.20"))
+
 MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 GRAFANA_URL = os.getenv("GRAFANA_URL", "http://grafana:3000")
+
 GRAFANA_USER = os.getenv("GRAFANA_USER", "admin")
 GRAFANA_PASSWORD = os.getenv("GRAFANA_PASSWORD", "admin")
+
 GRAFANA_BROWSER_URL = os.getenv("GRAFANA_BROWSER_URL", "http://localhost:3000")
+MLFLOW_BROWSER_URL = os.getenv("MLFLOW_BROWSER_URL","http://localhost:5000")
+PROMETHEUS_BROWSER_URL = os.getenv("PROMETHEUS_BROWSER_URL","http://localhost:9090")
+
 TOP_DRIFT_FEATURES = int(os.getenv("TOP_DRIFT_FEATURES", "100"))
 SEED = 42
 LOCK = threading.Lock()
@@ -316,7 +322,12 @@ def grafana_dashboard() -> dict[str, Any]:
 # -----------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def home() -> str:
-    return DASHBOARD_HTML
+    return (
+        DASHBOARD_HTML
+        .replace("__GRAFANA_BROWSER_URL__", GRAFANA_BROWSER_URL)
+        .replace("__MLFLOW_BROWSER_URL__", MLFLOW_BROWSER_URL)
+        .replace("__PROMETHEUS_BROWSER_URL__", PROMETHEUS_BROWSER_URL)
+    )
 
 
 @app.get("/metrics")
@@ -862,7 +873,7 @@ pre{background:#101b2e;color:#d9e8f7;padding:16px;border-radius:8px;min-height:1
 
 <div class="card span-12"><div class="eyebrow">Evidence and services</div>
 <button onclick="run(()=>api('/api/grafana/dashboard',{method:'POST'}))">Create Grafana dashboard</button>
-<a href="http://localhost:3000" target="_blank">Grafana</a><a href="http://localhost:5000" target="_blank">MLflow</a><a href="http://localhost:9090" target="_blank">Prometheus</a><a href="/report" target="_blank">Latest report</a><a href="/docs" target="_blank">Control API</a>
+<a href="__GRAFANA_BROWSER_URL__" target="_blank">Grafana</a><a href="__MLFLOW_BROWSER_URL__" target="_blank">MLflow</a><a href="__PROMETHEUS_BROWSER_URL__" target="_blank">Prometheus</a><a href="/report" target="_blank">Latest report</a><a href="/docs" target="_blank">Control API</a>
 <button class="secondary" onclick="resetAll()">Reset entire workspace</button><pre id="log">Ready.</pre></div>
 </section></main>
 <script>
