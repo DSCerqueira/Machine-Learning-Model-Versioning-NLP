@@ -454,6 +454,8 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
 
     model_path = model_directory / "model.joblib"
     tfidf_path = model_directory / "tfidf.pkl"
+    manifest_path = model_directory / "manifest.json"
+
     joblib.dump(model, model_path)
 
     # Save the FITTED TF-IDF transformer from the final fitted pipeline.
@@ -473,7 +475,12 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         "path": str(model_path),
         "tfidf_path": str(tfidf_path),
     }
-    (model_directory / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    manifest_path.write_text(
+            json.dumps(manifest, indent=2, default=str),
+            encoding="utf-8"
+        )
+    # (model_directory / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     mlflow.set_tracking_uri(MLFLOW_URI)
     mlflow.set_experiment("ml_work_flow_training")
@@ -493,6 +500,7 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
             name=manifest["dataset"],
             targets="label",
         )
+
         mlflow.log_input(training_dataset, context="training")
 
         example_inputs = X_test.head(5).tolist()
@@ -505,17 +513,29 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         
         model_info = mlflow.sklearn.log_model(
             sk_model=model,
-            artifact_path="model",
+            name="model",
             signature=signature,
+            input_example=example_inputs,
             registered_model_name=registered_model,
-            input_example=example_inputs
+            serialization_format="skops",
+            skops_trusted_types=[
+                "app.scr.preprocessing_utils.preprocess_text"
+            ],
+            
         )
 
+        mlflow.set_tag("logged_model_id", model_info.model_id)
+        mlflow.set_tag("logged_model_uri", model_info.model_uri)
+
+        mlflow.log_artifact(
+            str(model_path),
+            artifact_path="model"
+        )
+        
         artifact_example = X_test.head(10).to_frame(name="sentence")
         example_path = model_directory / "input_example.csv"
 
         artifact_example.to_csv(example_path, index=False)
-
         mlflow.log_artifact(str(example_path),artifact_path="examples")
                 
         mlflow.log_artifact(str(tfidf_path), artifact_path="feature_engineering")
