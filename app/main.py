@@ -27,6 +27,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
+from app.scr.preprocessing_utils import preprocess_text
+from mlflow.models.signature import infer_signature, ModelSignature
 
 warnings.filterwarnings("ignore")
 
@@ -107,15 +109,6 @@ def read_state() -> dict[str, Any]:
 def write_state(state: dict[str, Any]) -> None:
     ensure_dirs()
     STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
-
-
-def preprocess_text(text: str) -> str:
-    text = str(text).lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    tokens = text.split()
-    tokens = [stemmer.stem(token) for token in tokens]
-    return " ".join(tokens)
-
 
 def load_sst2() -> pd.DataFrame:
     """Load the SST-2 training split used by this project."""
@@ -502,11 +495,29 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         )
         mlflow.log_input(training_dataset, context="training")
 
+        example_inputs = X_test.head(5).tolist()
+        example_predictions = model.predict(example_inputs)
+        
+        signature = infer_signature(
+            example_inputs,
+            example_predictions
+        )
+        
         model_info = mlflow.sklearn.log_model(
             sk_model=model,
             artifact_path="model",
-            registered_model_name=registered_model
+            signature=signature,
+            registered_model_name=registered_model,
+            input_example=example_inputs
         )
+
+        artifact_example = X_test.head(10).to_frame(name="sentence")
+        example_path = model_directory / "input_example.csv"
+
+        artifact_example.to_csv(example_path, index=False)
+
+        mlflow.log_artifact(str(example_path),artifact_path="examples")
+                
         mlflow.log_artifact(str(tfidf_path), artifact_path="feature_engineering")
         mlflow.log_dict(manifest, "model_manifest.json")
 
