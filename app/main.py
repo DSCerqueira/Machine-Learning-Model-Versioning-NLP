@@ -802,8 +802,9 @@ def evaluate_drift() -> dict[str, Any]:
         "mlflow_run_name": run.info.run_name,
     })
 
-    state.update({"stage": "evaluated", "last_evaluation": result})
-    write_state(state)
+    current_state = read_state()
+    current_state.update({"stage": "evaluated", "last_evaluation": result})
+    write_state(current_state)
     return result
 
 
