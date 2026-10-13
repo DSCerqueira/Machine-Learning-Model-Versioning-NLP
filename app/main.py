@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import html
 import os
 import re
 import shutil
@@ -18,17 +19,22 @@ import pandas as pd
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
-from nltk.stem import PorterStemmer
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
-from scipy.spatial.distance import jensenshannon
-from scipy.stats import ks_2samp
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from app.scr.preprocessing_utils import preprocess_text
-from mlflow.models.signature import infer_signature, ModelSignature
+from app.monitoring import (
+    build_psi_baseline,
+    evaluate_drift as evaluate_monitoring_drift,
+    extract_nlp_monitoring_features,
+    important_tfidf_indices,
+    load_psi_baseline,
+    save_psi_baseline,
+)
+from mlflow.models.signature import infer_signature
 
 warnings.filterwarnings("ignore")
 
@@ -55,6 +61,9 @@ MLFLOW_BROWSER_URL = os.getenv("MLFLOW_BROWSER_URL","http://localhost:5000")
 PROMETHEUS_BROWSER_URL = os.getenv("PROMETHEUS_BROWSER_URL","http://localhost:9090")
 
 TOP_DRIFT_FEATURES = int(os.getenv("TOP_DRIFT_FEATURES", "100"))
+ENABLE_TFIDF_TERM_MONITORING = os.getenv("ENABLE_TFIDF_TERM_MONITORING", "true").lower() in {
+    "1", "true", "yes",
+}
 SEED = 42
 LOCK = threading.Lock()
 
@@ -75,10 +84,13 @@ DRIFT_BREACH = Gauge("ml_drift_breach", "1 when PSI exceeds its threshold")
 QUALITY_PASS = Gauge("ml_quality_pass", "1 when the latest data quality gate passed")
 MODEL_ACCURACY = Gauge("ml_model_accuracy", "Accuracy of the active model")
 MODEL_F1 = Gauge("ml_model_f1", "F1 score of the active model")
+NLP_BASELINE_VERSION = Gauge("ml_nlp_baseline_version", "Active NLP PSI baseline version")
+NLP_BREACHED_FEATURES = Gauge(
+    "ml_nlp_breached_features", "Number of breached primary NLP features"
+)
 PREDICTIONS = Counter("ml_predictions_total", "Prediction requests", ["status"])
 
 app = FastAPI(title="ml_work_flow", version="2.0.0")
-stemmer = PorterStemmer()
 
 
 # -----------------------------------------------------------------------------
@@ -206,53 +218,6 @@ def model_catalog() -> list[dict[str, Any]]:
 # -----------------------------------------------------------------------------
 # Drift helpers
 # -----------------------------------------------------------------------------
-def histogram_probabilities(
-    reference: np.ndarray,
-    current: np.ndarray,
-    bins: int = 10,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Create comparable normalized histograms robust to sparse/constant TF-IDF data."""
-    reference = np.asarray(reference, dtype=float)
-    current = np.asarray(current, dtype=float)
-
-    if reference.size == 0 or current.size == 0:
-        raise ValueError("Cannot calculate drift on an empty feature")
-
-    edges = np.unique(np.quantile(reference, np.linspace(0, 1, bins + 1)))
-
-    # Sparse TF-IDF columns are often constant/mostly zero. Fall back to a
-    # shared min/max range if reference quantiles collapse to one value.
-    if edges.size < 2:
-        combined_min = float(min(reference.min(), current.min()))
-        combined_max = float(max(reference.max(), current.max()))
-        if np.isclose(combined_min, combined_max):
-            # Identical constant distributions -> no drift.
-            return np.array([1.0]), np.array([1.0])
-        edges = np.linspace(combined_min, combined_max, bins + 1)
-
-    edges = edges.astype(float)
-    edges[0] = -np.inf
-    edges[-1] = np.inf
-
-    expected = np.histogram(reference, bins=edges)[0].astype(float)
-    actual = np.histogram(current, bins=edges)[0].astype(float)
-
-    expected /= max(expected.sum(), 1.0)
-    actual /= max(actual.sum(), 1.0)
-
-    epsilon = 1e-6
-    expected = np.clip(expected, epsilon, None)
-    actual = np.clip(actual, epsilon, None)
-    expected /= expected.sum()
-    actual /= actual.sum()
-    return expected, actual
-
-
-def psi(reference: np.ndarray, current: np.ndarray, bins: int = 10) -> float:
-    expected, actual = histogram_probabilities(reference, current, bins=bins)
-    return float(np.sum((actual - expected) * np.log(actual / expected)))
-
-
 def quality_gate(reference: pd.DataFrame, current: pd.DataFrame) -> int:
     if list(reference.columns) != list(current.columns):
         raise HTTPException(status_code=400, detail="Schema check failed: columns differ")
@@ -276,15 +241,6 @@ def quality_gate(reference: pd.DataFrame, current: pd.DataFrame) -> int:
     return duplicate_rows
 
 
-def important_tfidf_indices(model: Pipeline, top_n: int) -> np.ndarray:
-    """Return indices of TF-IDF terms with largest absolute LR coefficients."""
-    classifier: LogisticRegression = model.named_steps["lr"]
-    coefficients = np.asarray(classifier.coef_)
-    importance = np.max(np.abs(coefficients), axis=0)
-    top_n = min(top_n, importance.size)
-    return np.argsort(importance)[-top_n:][::-1]
-
-
 # -----------------------------------------------------------------------------
 # Grafana dashboard
 # -----------------------------------------------------------------------------
@@ -304,8 +260,11 @@ def grafana_dashboard() -> dict[str, Any]:
             {"id": 2, "type": "stat", "title": "Model version", "gridPos": {"h": 5, "w": 6, "x": 6, "y": 0}, "datasource": datasource, "targets": [{"refId": "A", "expr": "ml_model_version"}]},
             {"id": 3, "type": "stat", "title": "Model accuracy", "gridPos": {"h": 5, "w": 6, "x": 12, "y": 0}, "datasource": datasource, "targets": [{"refId": "A", "expr": "ml_model_accuracy * 100"}], "fieldConfig": {"defaults": {"unit": "percent", "decimals": 1}}},
             {"id": 4, "type": "stat", "title": "Drift breach", "gridPos": {"h": 5, "w": 6, "x": 18, "y": 0}, "datasource": datasource, "targets": [{"refId": "A", "expr": "ml_drift_breach"}]},
-            {"id": 5, "type": "timeseries", "title": "Drift metrics", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6}, "datasource": datasource, "targets": [{"refId": "A", "expr": "ml_drift_psi", "legendFormat": "PSI {{feature}}"}, {"refId": "B", "expr": "ml_drift_ks_statistic", "legendFormat": "KS {{feature}}"}, {"refId": "C", "expr": "ml_drift_js_divergence", "legendFormat": "JS {{feature}}"}]},
-            {"id": 6, "type": "timeseries", "title": "Quality and model", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6}, "datasource": datasource, "targets": [{"refId": "A", "expr": "ml_quality_pass", "legendFormat": "quality"}, {"refId": "B", "expr": "ml_model_f1", "legendFormat": "F1"}]},
+            {"id": 5, "type": "timeseries", "title": "NLP feature PSI", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6}, "datasource": datasource, "targets": [{"refId": "A", "expr": "ml_drift_psi", "legendFormat": "{{feature}}"}], "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": None}, {"color": "red", "value": PSI_THRESHOLD}]}}}},
+            {"id": 6, "type": "timeseries", "title": "KS statistic", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6}, "datasource": datasource, "targets": [{"refId": "A", "expr": "ml_drift_ks_statistic", "legendFormat": "{{feature}}"}]},
+            {"id": 7, "type": "timeseries", "title": "Jensen-Shannon divergence", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14}, "datasource": datasource, "targets": [{"refId": "A", "expr": "ml_drift_js_divergence", "legendFormat": "{{feature}}"}]},
+            {"id": 8, "type": "timeseries", "title": "Quality and model", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14}, "datasource": datasource, "targets": [{"refId": "A", "expr": "ml_quality_pass", "legendFormat": "quality"}, {"refId": "B", "expr": "ml_model_f1", "legendFormat": "F1"}]},
+            {"id": 9, "type": "stat", "title": "Breached NLP features", "gridPos": {"h": 5, "w": 6, "x": 0, "y": 22}, "datasource": datasource, "targets": [{"refId": "A", "expr": "ml_nlp_breached_features"}]},
         ],
     }
 
@@ -377,6 +336,14 @@ def create_dataset_version(payload: dict[str, str]) -> dict[str, Any]:
 
     DATASET_VERSION.set(version)
     MODEL_VERSION.set(0)
+    MODEL_ACCURACY.set(0)
+    MODEL_F1.set(0)
+    DRIFT_BREACH.set(0)
+    QUALITY_PASS.set(0)
+    NLP_BASELINE_VERSION.set(0)
+    NLP_BREACHED_FEATURES.set(0)
+    for metric in (PSI_METRIC, KS_METRIC, JS_METRIC):
+        metric.clear()
     return manifest
 
 
@@ -462,6 +429,29 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     fitted_tfidf: TfidfVectorizer = model.named_steps["tfidf"]
     joblib.dump(fitted_tfidf, tfidf_path)
 
+    selected_terms: list[dict[str, Any]] = []
+    if ENABLE_TFIDF_TERM_MONITORING and TOP_DRIFT_FEATURES > 0:
+        feature_names = fitted_tfidf.get_feature_names_out()
+        selected_indices = important_tfidf_indices(model, TOP_DRIFT_FEATURES)
+        selected_terms = [
+            {"term": str(feature_names[index]), "index": int(index)}
+            for index in selected_indices
+        ]
+
+    baseline_reference_features = extract_nlp_monitoring_features(
+        X_train_final, model, positive_label=1, selected_terms=selected_terms
+    )
+    classifier_classes = [str(value) for value in model.named_steps["lr"].classes_]
+    baseline = build_psi_baseline(
+        baseline_reference_features,
+        model_version=version,
+        dataset_version=f"{active['name']}_v{active['version']:03d}",
+        categorical_classes={"predicted_sentiment": classifier_classes},
+        selected_vocabulary_terms=selected_terms,
+    )
+    baseline_path = model_directory / "nlp_psi_baseline.joblib"
+    save_psi_baseline(baseline, baseline_path)
+
     manifest = {
         "version": version,
         "dataset_name": active["name"],
@@ -474,6 +464,13 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         "created_at": now(),
         "path": str(model_path),
         "tfidf_path": str(tfidf_path),
+        "psi_baseline_path": baseline_path.name,
+        "psi_baseline_version": baseline["schema_version"],
+        "psi_baseline_features": baseline["feature_names"],
+        "psi_baseline_created_at": baseline["created_at"],
+        "psi_baseline_dataset": baseline["dataset_version"],
+        "tfidf_term_monitoring": bool(selected_terms),
+        "selected_tfidf_terms": selected_terms,
     }
 
     manifest_path.write_text(
@@ -490,6 +487,11 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         mlflow.log_param("dataset_version", manifest["dataset"])
         mlflow.log_param("algorithm", manifest["algorithm"])
         mlflow.log_params({f"best_{k}": v for k, v in grid_search.best_params_.items()})
+        mlflow.log_param("psi_baseline_version", baseline["schema_version"])
+        mlflow.log_param("psi_baseline_features", len(baseline["feature_names"]))
+        mlflow.log_param("psi_baseline_bins", baseline["bins"])
+        mlflow.log_param("psi_baseline_sparsity_threshold", baseline["sparsity_threshold"])
+        mlflow.log_param("tfidf_term_monitoring", bool(selected_terms))
         mlflow.log_metric("validation_accuracy", validation_accuracy)
         mlflow.log_metric("test_accuracy", accuracy)
         mlflow.log_metric("test_f1", f1)
@@ -539,6 +541,7 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         mlflow.log_artifact(str(example_path),artifact_path="examples")
                 
         mlflow.log_artifact(str(tfidf_path), artifact_path="feature_engineering")
+        mlflow.log_artifact(str(baseline_path), artifact_path="monitoring/psi_baseline")
         mlflow.log_dict(manifest, "model_manifest.json")
 
     registry_versions = mlflow.MlflowClient(tracking_uri=MLFLOW_URI).search_model_versions(
@@ -563,6 +566,11 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     MODEL_VERSION.set(version)
     MODEL_ACCURACY.set(accuracy)
     MODEL_F1.set(f1)
+    DRIFT_BREACH.set(0)
+    NLP_BASELINE_VERSION.set(int(baseline["schema_version"]))
+    NLP_BREACHED_FEATURES.set(0)
+    for metric in (PSI_METRIC, KS_METRIC, JS_METRIC):
+        metric.clear()
     return manifest
 
 
@@ -625,15 +633,16 @@ def reset_current_data() -> dict[str, str]:
     write_state(state)
     DRIFT_BREACH.set(0)
     QUALITY_PASS.set(0)
+    NLP_BREACHED_FEATURES.set(0)
+    for metric in (PSI_METRIC, KS_METRIC, JS_METRIC):
+        metric.clear()
     return {"stage": "dataset_ready", "message": "Current data restored to the reference snapshot"}
 
 
 @app.post("/api/drift/evaluate")
 def evaluate_drift() -> dict[str, Any]:
     reference_path, current_path, active = active_dataset_paths()
-    model_path, tfidf_path, active_model = active_model_paths()
-
-    # Ensure the active model belongs to the active dataset version.
+    model_path, _, active_model = active_model_paths()
     expected_dataset = f"{active['name']}_v{active['version']:03d}"
     if active_model.get("dataset") != expected_dataset:
         raise HTTPException(
@@ -646,74 +655,95 @@ def evaluate_drift() -> dict[str, Any]:
     QUALITY_PASS.set(0)
     duplicate_rows = quality_gate(reference, current)
 
-    state = read_state()
-    text_column = (state.get("drift") or {}).get("feature") or "sentence"
-    if text_column not in reference.columns:
-        raise HTTPException(status_code=400, detail=f"Text column '{text_column}' not found")
+    baseline_name = active_model.get("psi_baseline_path")
+    if not baseline_name:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The active model predates persistent PSI baselines. "
+                "Retrain the model to create a compatible baseline."
+            ),
+        )
+    baseline_path = model_path.parent / Path(baseline_name).name
+    if not model_path.exists() or not baseline_path.is_file():
+        raise HTTPException(
+            status_code=500,
+            detail=f"Active model or its PSI baseline artifact was not found: {baseline_path.name}",
+        )
 
-    if not model_path.exists() or not tfidf_path.exists():
-        raise HTTPException(status_code=500, detail="Active model or TF-IDF artifact was not found")
+    try:
+        model: Pipeline = joblib.load(model_path)
+        baseline = load_psi_baseline(baseline_path)
+        if str(baseline.get("model_version")) != str(active_model.get("version")):
+            raise ValueError("PSI baseline model version does not match the active model")
+        if baseline.get("dataset_version") != expected_dataset:
+            raise ValueError("PSI baseline dataset version does not match the active dataset")
+        if baseline.get("schema_version") != active_model.get("psi_baseline_version"):
+            raise ValueError("PSI baseline schema version does not match the model manifest")
 
-    model: Pipeline = joblib.load(model_path)
-    tfidf: TfidfVectorizer = joblib.load(tfidf_path)
+        current_texts = current["sentence"]
+        selected_terms = baseline.get("selected_vocabulary_terms", [])
+        current_features = extract_nlp_monitoring_features(
+            current_texts, model, positive_label=1, selected_terms=selected_terms
+        )
+        evaluation = evaluate_monitoring_drift(
+            current_features,
+            baseline,
+            model_version=active_model["version"],
+            threshold=PSI_THRESHOLD,
+        )
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=500, detail=f"Drift baseline evaluation failed: {exc}") from exc
 
-    X_reference = tfidf.transform(reference[text_column].fillna("").astype(str))
-    X_current = tfidf.transform(current[text_column].fillna("").astype(str))
-    feature_names = tfidf.get_feature_names_out()
+    feature_results = evaluation["feature_results"]
+    primary_results = evaluation["primary_results"]
+    vocabulary_results = evaluation["vocabulary_results"]
+    feature_results = sorted(
+        primary_results, key=lambda item: item["psi"], reverse=True
+    ) + sorted(vocabulary_results, key=lambda item: item["psi"], reverse=True)
+    most_drifted = primary_results[0]
 
-    monitored_indices = important_tfidf_indices(model, TOP_DRIFT_FEATURES)
-    feature_results: list[dict[str, Any]] = []
-
-    for index in monitored_indices:
-        feature_name = str(feature_names[index])
-        reference_values = X_reference[:, index].toarray().ravel()
-        current_values = X_current[:, index].toarray().ravel()
-
-        expected, actual = histogram_probabilities(reference_values, current_values)
-        psi_value = psi(reference_values, current_values)
-        ks_value, ks_pvalue = ks_2samp(reference_values, current_values)
-        js_value = float(jensenshannon(expected, actual, base=2) ** 2)
-
-        feature_results.append({
-            "feature": feature_name,
-            "psi": float(psi_value),
-            "ks": float(ks_value),
-            "ks_pvalue": float(ks_pvalue),
-            "js": js_value,
-            "breach": bool(psi_value > PSI_THRESHOLD),
-        })
-
-    if not feature_results:
-        raise HTTPException(status_code=500, detail="No TF-IDF features available for drift evaluation")
-
-    feature_results.sort(key=lambda item: item["psi"], reverse=True)
-    most_drifted = feature_results[0]
-    breached_features = sum(item["breach"] for item in feature_results)
-    breach_ratio = breached_features / len(feature_results)
-
-    # Overall breach retains the assignment's PSI threshold rule: if the most
-    # drifted monitored feature exceeds the threshold, flag a breach.
-    breach = bool(most_drifted["psi"] > PSI_THRESHOLD)
-
-    PSI_METRIC.labels(feature=most_drifted["feature"]).set(most_drifted["psi"])
-    KS_METRIC.labels(feature=most_drifted["feature"]).set(most_drifted["ks"])
-    JS_METRIC.labels(feature=most_drifted["feature"]).set(most_drifted["js"])
-    DRIFT_BREACH.set(int(breach))
+    PSI_METRIC.clear()
+    KS_METRIC.clear()
+    JS_METRIC.clear()
+    for feature_result in primary_results:
+        feature_name = feature_result["feature"]
+        PSI_METRIC.labels(feature=feature_name).set(feature_result["psi"])
+        JS_METRIC.labels(feature=feature_name).set(feature_result["js"])
+        if feature_result["ks"] is not None:
+            KS_METRIC.labels(feature=feature_name).set(feature_result["ks"])
+    DRIFT_BREACH.set(int(evaluation["breach"]))
+    NLP_BASELINE_VERSION.set(int(baseline["schema_version"]))
+    NLP_BREACHED_FEATURES.set(int(evaluation["breached_features"]))
 
     result = {
         "dataset": expected_dataset,
         "model_version": active_model["version"],
-        "input_feature": text_column,
-        "monitored_tfidf_features": len(feature_results),
-        "most_drifted_tfidf_feature": most_drifted["feature"],
-        "psi": most_drifted["psi"],
-        "ks": most_drifted["ks"],
-        "ks_pvalue": most_drifted["ks_pvalue"],
-        "js": most_drifted["js"],
+        "baseline_version": baseline["schema_version"],
+        "monitored_features": evaluation["monitored_features"],
+        "most_drifted_feature": evaluation["most_drifted_feature"],
+        "psi": evaluation["psi"],
+        "ks": evaluation["ks"],
+        "ks_pvalue": evaluation["ks_pvalue"],
+        "js": evaluation["js"],
+        "maximum_primary_psi": evaluation["maximum_primary_psi"],
         "threshold": PSI_THRESHOLD,
-        "breached_features": breached_features,
-        "breach_ratio": breach_ratio,
-        "breach": breach,
+        "breached_features": evaluation["breached_features"],
+        "breach_ratio": evaluation["breach_ratio"],
+        "breach": evaluation["breach"],
+        "feature_results": feature_results,
+        "vocabulary_drift": {
+            "monitored_features": len(vocabulary_results),
+            "most_drifted_feature": (
+                max(vocabulary_results, key=lambda item: item["psi"])["feature"]
+                if vocabulary_results else None
+            ),
+            "maximum_psi": max(
+                (item["psi"] for item in vocabulary_results), default=0.0
+            ),
+            "breached_features": sum(item["psi"] > PSI_THRESHOLD for item in vocabulary_results),
+            "breach": any(item["psi"] > PSI_THRESHOLD for item in vocabulary_results),
+        },
         "duplicate_rows_warning": duplicate_rows,
         "evaluated_at": now(),
     }
@@ -730,7 +760,9 @@ def evaluate_drift() -> dict[str, Any]:
     mlflow.set_tracking_uri(MLFLOW_URI)
     mlflow.set_experiment("ml_work_flow_drift_evaluation")
 
-    with mlflow.start_run(run_name="drift-breach" if breach else "drift-check") as run:
+    with mlflow.start_run(
+        run_name="drift-breach" if result["breach"] else "drift-check"
+    ) as run:
         reference_dataset = mlflow.data.from_pandas(
             reference,
             source=str(reference_path),
@@ -745,16 +777,21 @@ def evaluate_drift() -> dict[str, Any]:
         mlflow.log_input(current_dataset, context="drift_current")
         mlflow.log_param("dataset_version", expected_dataset)
         mlflow.log_param("model_version", active_model["version"])
-        mlflow.log_param("text_column", text_column)
-        mlflow.log_param("most_drifted_tfidf_feature", most_drifted["feature"])
-        mlflow.log_param("monitored_tfidf_features", len(feature_results))
+        mlflow.log_param("baseline_version", baseline["schema_version"])
+        mlflow.log_param("most_drifted_feature", most_drifted["feature"])
+        mlflow.log_param("monitored_features", len(primary_results))
         mlflow.log_param("threshold", PSI_THRESHOLD)
-        mlflow.log_metric("psi", most_drifted["psi"])
-        mlflow.log_metric("ks", most_drifted["ks"])
-        mlflow.log_metric("ks_pvalue", most_drifted["ks_pvalue"])
-        mlflow.log_metric("js", most_drifted["js"])
-        mlflow.log_metric("breached_features", breached_features)
-        mlflow.log_metric("breach_ratio", breach_ratio)
+        mlflow.log_metric("maximum_primary_psi", result["maximum_primary_psi"])
+        mlflow.log_metric("breach", int(result["breach"]))
+        mlflow.log_metric("breached_features", result["breached_features"])
+        mlflow.log_metric("breach_ratio", result["breach_ratio"])
+        for feature_result in feature_results:
+            metric_feature = re.sub(r"[^A-Za-z0-9_]+", "_", feature_result["feature"]).strip("_")
+            mlflow.log_metric(f"psi.{metric_feature}", feature_result["psi"])
+            mlflow.log_metric(f"js.{metric_feature}", feature_result["js"])
+            if feature_result["ks"] is not None:
+                mlflow.log_metric(f"ks.{metric_feature}", feature_result["ks"])
+                mlflow.log_metric(f"ks_pvalue.{metric_feature}", feature_result["ks_pvalue"])
         mlflow.log_artifact(str(latest_html), artifact_path="drift-report")
         mlflow.log_artifact(str(latest_json), artifact_path="drift-report")
         mlflow.log_artifact(str(feature_csv), artifact_path="drift-report")
@@ -777,8 +814,13 @@ def reset_workspace() -> dict[str, str]:
             shutil.rmtree(directory)
     STATE_PATH.unlink(missing_ok=True)
     ensure_dirs()
-    for metric in (DATASET_VERSION, MODEL_VERSION, DRIFT_BREACH, QUALITY_PASS, MODEL_ACCURACY, MODEL_F1):
+    for metric in (
+        DATASET_VERSION, MODEL_VERSION, DRIFT_BREACH, QUALITY_PASS, MODEL_ACCURACY,
+        MODEL_F1, NLP_BASELINE_VERSION, NLP_BREACHED_FEATURES,
+    ):
         metric.set(0)
+    for metric in (PSI_METRIC, KS_METRIC, JS_METRIC):
+        metric.clear()
     return {"stage": "ready", "message": "Workspace reset. No dataset or model versions remain."}
 
 
@@ -841,10 +883,40 @@ def report() -> HTMLResponse:
 
 
 def report_html(result: dict[str, Any]) -> str:
-    status = "DRIFT BREACH" if result["breach"] else "NORMAL"
+    def escaped(value: Any) -> str:
+        return html.escape(str(value), quote=True)
+
+    status = "DRIFT BREACH" if result.get("breach") else "NORMAL"
+    summary = [
+        ("Dataset version", result.get("dataset")),
+        ("Model version", result.get("model_version")),
+        ("PSI baseline version", result.get("baseline_version")),
+        ("Overall drift status", status),
+        ("Most drifted feature", result.get("most_drifted_feature")),
+        ("Maximum primary PSI", result.get("maximum_primary_psi")),
+        ("KS statistic", result.get("ks")),
+        ("KS p-value", result.get("ks_pvalue")),
+        ("Jensen-Shannon divergence", result.get("js")),
+        ("PSI threshold", result.get("threshold")),
+        ("Breached primary features", result.get("breached_features")),
+        ("Breach ratio", result.get("breach_ratio")),
+        ("Evaluation timestamp", result.get("evaluated_at")),
+    ]
     rows = "".join(
-        f"<tr><td>{key}</td><td>{value}</td></tr>"
-        for key, value in result.items()
+        f"<tr><th>{escaped(label)}</th><td>{escaped(value)}</td></tr>"
+        for label, value in summary
+    )
+    feature_rows = "".join(
+        "<tr>"
+        f"<td>{escaped(item.get('feature'))}</td>"
+        f"<td>{escaped(item.get('scope'))}</td>"
+        f"<td>{escaped(item.get('psi'))}</td>"
+        f"<td>{escaped(item.get('ks'))}</td>"
+        f"<td>{escaped(item.get('ks_pvalue'))}</td>"
+        f"<td>{escaped(item.get('js'))}</td>"
+        f"<td>{'BREACH' if item.get('breach') else 'OK'}</td>"
+        "</tr>"
+        for item in result.get("feature_results", [])
     )
     return f"""<!doctype html>
 <html>
@@ -852,14 +924,18 @@ def report_html(result: dict[str, Any]) -> str:
 <meta charset="utf-8">
 <title>ml_work_flow report</title>
 <style>
-body{{font-family:system-ui;max-width:850px;margin:40px auto;background:#f5f7fb;color:#172033}}
+body{{font-family:system-ui;max-width:1000px;margin:40px auto;background:#f5f7fb;color:#172033}}
 main{{background:white;border:1px solid #dbe2ef;border-radius:12px;padding:28px}}
 .status{{font-weight:800}}
-table{{width:100%;border-collapse:collapse}}
-td{{padding:10px;border-bottom:1px solid #e5e9f2}}
+table{{width:100%;border-collapse:collapse;margin:16px 0 28px}}
+td,th{{padding:10px;border-bottom:1px solid #e5e9f2;text-align:left}}
 </style>
 </head>
-<body><main><h1>ml_work_flow drift report</h1><p class="status">{status}</p><table>{rows}</table></main></body>
+<body><main><h1>ml_work_flow drift report</h1><p class="status">{escaped(status)}</p>
+<table><tbody>{rows}</tbody></table>
+<h2>Feature-level results</h2>
+<table><thead><tr><th>Feature</th><th>Scope</th><th>PSI</th><th>KS</th><th>KS p-value</th><th>JS divergence</th><th>Status</th></tr></thead>
+<tbody>{feature_rows}</tbody></table></main></body>
 </html>"""
 
 
@@ -897,7 +973,7 @@ pre{background:#101b2e;color:#d9e8f7;padding:16px;border-radius:8px;min-height:1
 <button onclick="injectDrift()">Inject drift</button>
 <button onclick="run(()=>api('/api/drift/evaluate',{method:'POST'}))">Evaluate quality and drift</button>
 <button class="secondary" onclick="resetCurrent()">Restore current data</button>
-<p class="muted">Drift ratio is the fraction of reviews modified. Evaluation uses the saved fitted TF-IDF transformer and the top model-important terms.</p></div>
+<p class="muted">Drift ratio is the fraction of reviews modified. Evaluation reuses persistent NLP feature baselines created during model training; selected TF-IDF terms are supplementary.</p></div>
 
 <div class="card span-12"><div class="eyebrow">4. Prediction</div><h2>Test sentiment</h2>
 <input id="predictionText" type="text" value="this movie was excellent" size="50"><button onclick="predictSentiment()">Predict</button></div>
@@ -912,7 +988,7 @@ const log=document.getElementById('log');
 async function api(path,options={}){const response=await fetch(path,{headers:{'Content-Type':'application/json'},...options});const text=await response.text();let data;try{data=JSON.parse(text)}catch{data={detail:text||'Empty server response'}}if(!response.ok)throw new Error(data.detail||'Request failed');return data}
 function show(data){log.textContent='Success\n'+JSON.stringify(data,null,2);refresh()}
 async function run(fn){log.textContent='Working...';try{show(await fn())}catch(error){log.textContent='Error\n'+error.message}}
-async function refresh(){const data=await api('/api/state');const state=data.state;document.getElementById('dataset').textContent=state.active_dataset?state.active_dataset.name+'_v'+String(state.active_dataset.version).padStart(3,'0'):'None';document.getElementById('datasetInfo').textContent=state.active_dataset?state.active_dataset.description:'Create a version';document.getElementById('model').textContent=state.active_model?'model_v'+String(state.active_model.version).padStart(3,'0'):'None';document.getElementById('modelInfo').textContent=state.active_model?'Accuracy '+(state.active_model.accuracy*100).toFixed(1)+'% | F1 '+(state.active_model.f1*100).toFixed(1)+'%':'Train a model';document.getElementById('drift').textContent=state.last_evaluation?(state.last_evaluation.breach?'BREACH':'NORMAL'):'Not evaluated';document.getElementById('driftInfo').textContent=state.last_evaluation?'PSI '+state.last_evaluation.psi.toFixed(3)+' | '+state.last_evaluation.most_drifted_tfidf_feature:'PSI threshold configured on server'}
+async function refresh(){const data=await api('/api/state');const state=data.state;document.getElementById('dataset').textContent=state.active_dataset?state.active_dataset.name+'_v'+String(state.active_dataset.version).padStart(3,'0'):'None';document.getElementById('datasetInfo').textContent=state.active_dataset?state.active_dataset.description:'Create a version';document.getElementById('model').textContent=state.active_model?'model_v'+String(state.active_model.version).padStart(3,'0'):'None';document.getElementById('modelInfo').textContent=state.active_model?'Accuracy '+(state.active_model.accuracy*100).toFixed(1)+'% | F1 '+(state.active_model.f1*100).toFixed(1)+'%':'Train a model';document.getElementById('drift').textContent=state.last_evaluation?(state.last_evaluation.breach?'BREACH':'NORMAL'):'Not evaluated';const result=state.last_evaluation;const feature=result?(result.most_drifted_feature||result.most_drifted_tfidf_feature||'Unknown feature'):'';const psi=result&&Number.isFinite(Number(result.psi))?Number(result.psi).toFixed(3):'n/a';document.getElementById('driftInfo').textContent=result?'PSI '+psi+' | '+feature:'PSI threshold configured on server'}
 async function createDataset(){run(()=>api('/api/datasets/version',{method:'POST',body:JSON.stringify({name:'sst2'})}))}
 async function trainModel(){run(()=>api('/api/models/train',{method:'POST',body:'{}'}))}
 async function injectDrift(){run(()=>api('/api/drift/inject',{method:'POST',body:JSON.stringify({feature:'sentence',drift_text:document.getElementById('driftText').value,drift_ratio:Number(document.getElementById('driftRatio').value)})}))}
