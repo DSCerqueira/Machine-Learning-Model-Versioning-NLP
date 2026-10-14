@@ -7,9 +7,9 @@ services:
       GRAFANA_USER: admin
       GRAFANA_PASSWORD: admin
       GRAFANA_BROWSER_URL: http://${SERVER_IP}:3000
-      MLFLOW_BROWSER_URL: http://${SERVER_IP}:5000
+      MLFLOW_BROWSER_URL: http://${SERVER_IP:-10.0.0.146}:5000
       PROMETHEUS_BROWSER_URL: http://${SERVER_IP}:9090
-      SERVER_IP: ${SERVER_IP}
+      SERVER_IP: ${SERVER_IP:-10.0.0.146}
       PSI_THRESHOLD: "0.20"
       PYTHONUNBUFFERED: "1"
     volumes:
@@ -35,7 +35,9 @@ services:
       - --artifacts-destination
       - /mlflow/artifacts
       - --allowed-hosts
-      - "mlflow:5000,localhost:5000,127.0.0.1:5000,${SERVER_IP:-127.0.0.1}:5000"
+      - "mlflow:5000,localhost:5000,127.0.0.1:5000,10.0.0.146,${SERVER_IP:-10.0.0.226},${SERVER_IP:-10.0.0.146}:5000"
+      - --cors-allowed-origins
+      - "http://localhost:5000,http://127.0.0.1:5000,http://10.0.0.146:5000,http://${SERVER_IP:-10.0.0.226}:5000"
     volumes:
       - mlflow-data:/mlflow
     ports:
