@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import html
 import os
 import re
@@ -619,6 +620,7 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
             model_info = mlflow.sklearn.log_model(
                 sk_model=model,
                 artifact_path="model",
+                serialization_format="cloudpickle",
                 signature=signature,
                 input_example=example_inputs,
                 registered_model_name=registered_model,
@@ -638,14 +640,24 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
             mlflow.log_dict(manifest, "model_manifest.json")
             mlflow.log_dict(evaluation_report, "evaluation/evaluation_report.json")
 
-        registry_versions = mlflow.MlflowClient(tracking_uri=MLFLOW_URI).search_model_versions(
-            f"name='{registered_model}'"
-        )
-        registry_version = next(
-            (item.version for item in registry_versions if item.run_id == run.info.run_id),
-            None,
-        )
+        registry_version = getattr(model_info, "registered_model_version", None)
+        if registry_version is None:
+            registry_versions = mlflow.MlflowClient(tracking_uri=MLFLOW_URI).search_model_versions(
+                f"name='{registered_model}'"
+            )
+            registry_version = next(
+                (
+                    item.version
+                    for item in registry_versions
+                    if item.run_id == run.info.run_id
+                    or (logged_model_id and getattr(item, "model_id", None) == logged_model_id)
+                ),
+                None,
+            )
+            if registry_version is None and registry_versions:
+                registry_version = max(registry_versions, key=lambda item: int(item.version)).version
     except Exception as exc:
+        logging.getLogger("uvicorn.error").exception("MLflow logging or registration failed")
         raise HTTPException(
             status_code=502,
             detail=f"MLflow logging or registration failed: {exc}",
