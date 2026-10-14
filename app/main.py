@@ -348,8 +348,8 @@ def create_dataset_version(payload: dict[str, str]) -> dict[str, Any]:
 
     DATASET_VERSION.set(version)
     MODEL_VERSION.set(0)
-    MODEL_ACCURACY.set(0)
-    MODEL_F1.set(0)
+    MODEL_ACCURACY.clear()
+    MODEL_F1.clear()
     DRIFT_BREACH.set(0)
     QUALITY_PASS.set(0)
     NLP_BASELINE_VERSION.set(0)
@@ -680,8 +680,15 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     state.update({"active_model": manifest, "stage": "model_trained"})
     write_state(state)
     MODEL_VERSION.set(version)
-    MODEL_ACCURACY.set(accuracy)
-    MODEL_F1.set(f1)
+    MODEL_ACCURACY.clear()
+    MODEL_F1.clear()
+    metric_labels = {
+        "run_name": run.info.run_name,
+        "Models": registered_model,
+        "model_type": model_type,
+    }
+    MODEL_ACCURACY.labels(**metric_labels).set(accuracy)
+    MODEL_F1.labels(**metric_labels).set(f1)
     DRIFT_BREACH.set(0)
     NLP_BASELINE_VERSION.set(int(baseline["schema_version"]))
     NLP_BREACHED_FEATURES.set(0)
@@ -932,11 +939,11 @@ def reset_workspace() -> dict[str, str]:
     STATE_PATH.unlink(missing_ok=True)
     ensure_dirs()
     for metric in (
-        DATASET_VERSION, MODEL_VERSION, DRIFT_BREACH, QUALITY_PASS, MODEL_ACCURACY,
-        MODEL_F1, NLP_BASELINE_VERSION, NLP_BREACHED_FEATURES,
+        DATASET_VERSION, MODEL_VERSION, DRIFT_BREACH, QUALITY_PASS,
+        NLP_BASELINE_VERSION, NLP_BREACHED_FEATURES,
     ):
         metric.set(0)
-    for metric in (PSI_METRIC, KS_METRIC, JS_METRIC):
+    for metric in (MODEL_ACCURACY, MODEL_F1, PSI_METRIC, KS_METRIC, JS_METRIC):
         metric.clear()
     return {"stage": "ready", "message": "Workspace reset. No dataset or model versions remain."}
 
