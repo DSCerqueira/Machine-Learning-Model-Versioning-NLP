@@ -4,6 +4,7 @@ pandas
 numpy
 scipy
 scikit-learn
+lightgbm>=4.0,<5
 joblib
 mlflow
 prometheus-client

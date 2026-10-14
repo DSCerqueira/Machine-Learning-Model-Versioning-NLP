@@ -21,11 +21,23 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
-from app.scr.preprocessing_utils import preprocess_text
+from app.modeling import (
+    MODEL_DISPLAY_NAMES,
+    SEED,
+    classifier_probabilities,
+    create_text_pipeline,
+    get_pipeline_classifier,
+)
 from app.monitoring import (
     build_psi_baseline,
     evaluate_drift as evaluate_monitoring_drift,
@@ -64,7 +76,6 @@ TOP_DRIFT_FEATURES = int(os.getenv("TOP_DRIFT_FEATURES", "100"))
 ENABLE_TFIDF_TERM_MONITORING = os.getenv("ENABLE_TFIDF_TERM_MONITORING", "true").lower() in {
     "1", "true", "yes",
 }
-SEED = 42
 LOCK = threading.Lock()
 
 # Use a filesystem-safe internal name. Do not use "stanfordnlp/sst2" as a folder name.
@@ -354,41 +365,59 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     if not active:
         raise HTTPException(status_code=400, detail="Create a dataset version before training")
 
+    model_type = (payload or {}).get("model_type", "logistic_regression")
+    if not isinstance(model_type, str) or model_type not in MODEL_DISPLAY_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported model type. Choose one of: {', '.join(MODEL_DISPLAY_NAMES)}",
+        )
+
     directory = version_path(active["name"], active["version"])
-    frame = pd.read_csv(directory / "reference.csv")
+    reference_path = directory / "reference.csv"
+    if not reference_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Dataset snapshot was not found: {active['name']}_v{active['version']:03d}",
+        )
+    frame = pd.read_csv(reference_path)
+    required_columns = {"sentence", "label"}
+    if frame.empty or not required_columns.issubset(frame.columns):
+        raise HTTPException(
+            status_code=400,
+            detail="Training dataset must be non-empty and contain 'sentence' and 'label' columns",
+        )
     X = frame["sentence"].fillna("").astype(str)
-    y = frame["label"].astype(int)
+    try:
+        y = frame["label"].astype(int)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Training labels must be integers") from exc
+    if y.nunique() != 2 or int(y.value_counts().min()) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Training dataset needs two classes with at least 8 examples per class",
+        )
 
-    X_train_temp, X_test, y_train_temp, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=SEED, stratify=y
-    )
-    X_train, X_validation, y_train, y_validation = train_test_split(
-        X_train_temp,
-        y_train_temp,
-        test_size=0.20,
-        random_state=SEED,
-        stratify=y_train_temp,
-    )
+    base_pipeline, param_grid = create_text_pipeline(model_type)
+    try:
+        X_train_temp, X_test, y_train_temp, y_test = train_test_split(
+            X, y, test_size=0.20, random_state=SEED, stratify=y
+        )
+        X_train, X_validation, y_train, y_validation = train_test_split(
+            X_train_temp,
+            y_train_temp,
+            test_size=0.20,
+            random_state=SEED,
+            stratify=y_train_temp,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid training dataset split: {exc}") from exc
 
-    base_pipeline = Pipeline([
-        ("tfidf", TfidfVectorizer(
-            preprocessor=preprocess_text,
-            lowercase=True,
-            stop_words="english",
-            token_pattern=r"(?u)\b[a-zA-Z0-9]+\b",
-            max_features=20000,
-            ngram_range=(1, 2),
-        )),
-        ("lr", LogisticRegression(random_state=SEED)),
-    ])
-
-    param_grid = {
-        "lr__C": [0.01, 0.1, 1, 10],
-        "lr__penalty": ["l2"],
-        "lr__solver": ["lbfgs", "saga"],
-        "lr__max_iter": [1000, 2000],
-    }
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    if int(y_train.value_counts().min()) < cv.n_splits:
+        raise HTTPException(
+            status_code=400,
+            detail="Training split needs at least 5 examples in each class for stratified tuning",
+        )
     grid_search = GridSearchCV(
         estimator=base_pipeline,
         param_grid=param_grid,
@@ -396,23 +425,43 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         scoring="accuracy",
         n_jobs=-1,
         verbose=1,
+        error_score="raise",
     )
-    grid_search.fit(X_train, y_train)
+    try:
+        grid_search.fit(X_train, y_train)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{MODEL_DISPLAY_NAMES[model_type]} hyperparameter tuning failed: {exc}",
+        ) from exc
 
     validation_predictions = grid_search.best_estimator_.predict(X_validation)
     validation_accuracy = float(accuracy_score(y_validation, validation_predictions))
-
-    print("Validation Accutacy: ",validation_accuracy)
 
     # Refit the selected configuration on train + validation, leaving test untouched.
     X_train_final = pd.concat([X_train, X_validation])
     y_train_final = pd.concat([y_train, y_validation])
     model: Pipeline = grid_search.best_estimator_
-    model.fit(X_train_final, y_train_final)
+    try:
+        model.fit(X_train_final, y_train_final)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Model training failed: {exc}") from exc
 
     predictions = model.predict(X_test)
     accuracy = float(accuracy_score(y_test, predictions))
     f1 = float(f1_score(y_test, predictions, average="weighted"))
+    precision = float(precision_score(y_test, predictions, average="weighted", zero_division=0))
+    recall = float(recall_score(y_test, predictions, average="weighted", zero_division=0))
+    classifier = get_pipeline_classifier(model)
+    classes, prediction_scores = classifier_probabilities(
+        classifier, model.named_steps["tfidf"].transform(X_test)
+    )
+    roc_auc = None
+    if len(classes) == 2:
+        positive_matches = np.flatnonzero(classes == 1)
+        if len(positive_matches) == 1:
+            roc_auc = float(roc_auc_score(y_test, prediction_scores[:, int(positive_matches[0])]))
+    confusion = confusion_matrix(y_test, predictions, labels=classes).tolist()
 
     with LOCK:
         version = next_model_version(active["name"])
@@ -441,7 +490,7 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     baseline_reference_features = extract_nlp_monitoring_features(
         X_train_final, model, positive_label=1, selected_terms=selected_terms
     )
-    classifier_classes = [str(value) for value in model.named_steps["lr"].classes_]
+    classifier_classes = [str(value) for value in classes]
     baseline = build_psi_baseline(
         baseline_reference_features,
         model_version=version,
@@ -452,18 +501,49 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     baseline_path = model_directory / "nlp_psi_baseline.joblib"
     save_psi_baseline(baseline, baseline_path)
 
+    dataset_version = f"{active['name']}_v{active['version']:03d}"
+    algorithm_name = MODEL_DISPLAY_NAMES[model_type]
+    tfidf_config = {
+        "lowercase": True,
+        "stop_words": "english",
+        "token_pattern": r"(?u)\b[a-zA-Z0-9]+\b",
+        "max_features": 20000,
+        "ngram_range": [1, 2],
+        "preprocessor": "preprocess_text",
+    }
+    evaluation_report = {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "roc_auc": roc_auc,
+        "confusion_matrix": confusion,
+        "class_labels": [str(value) for value in classes],
+    }
+    evaluation_path = model_directory / "evaluation.json"
+    evaluation_path.write_text(json.dumps(evaluation_report, indent=2), encoding="utf-8")
+
     manifest = {
         "version": version,
         "dataset_name": active["name"],
-        "dataset": f"{active['name']}_v{active['version']:03d}",
-        "algorithm": "TF-IDF + LogisticRegression",
+        "dataset": dataset_version,
+        "model_type": model_type,
+        "algorithm": f"TF-IDF + {algorithm_name}",
         "validation_accuracy": validation_accuracy,
         "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
         "f1": f1,
+        "roc_auc": roc_auc,
+        "confusion_matrix": confusion,
         "best_params": grid_search.best_params_,
+        "cv_best_score": float(grid_search.best_score_),
+        "tfidf_config": tfidf_config,
+        "random_seed": SEED,
         "created_at": now(),
         "path": str(model_path),
         "tfidf_path": str(tfidf_path),
+        "evaluation_path": str(evaluation_path),
         "psi_baseline_path": baseline_path.name,
         "psi_baseline_version": baseline["schema_version"],
         "psi_baseline_features": baseline["feature_names"],
@@ -479,78 +559,102 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         )
     # (model_directory / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    mlflow.set_tracking_uri(MLFLOW_URI)
-    mlflow.set_experiment("ml_work_flow_training")
-    registered_model = f"ml_work_flow_model_{active['name']}"
+    registered_model = f"sentiment_{model_type}"
+    try:
+        mlflow.set_tracking_uri(MLFLOW_URI)
+        mlflow.set_experiment("ml_work_flow_training")
+        with mlflow.start_run(run_name=f"{model_type}-v{version:03d}") as run:
+            mlflow.log_params({
+                "model_type": model_type,
+                "algorithm": manifest["algorithm"],
+                "dataset_version": dataset_version,
+                "random_seed": SEED,
+                "cv_best_score": float(grid_search.best_score_),
+                "tfidf_config": json.dumps(tfidf_config, sort_keys=True),
+                **{
+                    f"model_{key}": value
+                    for key, value in classifier.get_params(deep=False).items()
+                    if isinstance(value, (str, int, float, bool))
+                },
+                **{
+                    f"best_{key.removeprefix('classifier__')}": value
+                    for key, value in grid_search.best_params_.items()
+                },
+            })
+            mlflow.set_tags({
+                "task": "sentiment_classification",
+                "algorithm": model_type,
+                "feature_extraction": "tfidf",
+                "dataset_version": dataset_version,
+            })
+            mlflow.log_params({
+                "psi_baseline_version": baseline["schema_version"],
+                "psi_baseline_features": len(baseline["feature_names"]),
+                "psi_baseline_bins": baseline["bins"],
+                "psi_baseline_sparsity_threshold": baseline["sparsity_threshold"],
+                "tfidf_term_monitoring": bool(selected_terms),
+            })
+            mlflow.log_metrics({
+                "validation_accuracy": validation_accuracy,
+                "test_accuracy": accuracy,
+                "test_precision": precision,
+                "test_recall": recall,
+                "test_f1": f1,
+                "cv_best_score": float(grid_search.best_score_),
+            })
+            if roc_auc is not None:
+                mlflow.log_metric("test_roc_auc", roc_auc)
 
-    with mlflow.start_run(run_name=f"model-v{version:03d}") as run:
-        mlflow.log_param("dataset_version", manifest["dataset"])
-        mlflow.log_param("algorithm", manifest["algorithm"])
-        mlflow.log_params({f"best_{k}": v for k, v in grid_search.best_params_.items()})
-        mlflow.log_param("psi_baseline_version", baseline["schema_version"])
-        mlflow.log_param("psi_baseline_features", len(baseline["feature_names"]))
-        mlflow.log_param("psi_baseline_bins", baseline["bins"])
-        mlflow.log_param("psi_baseline_sparsity_threshold", baseline["sparsity_threshold"])
-        mlflow.log_param("tfidf_term_monitoring", bool(selected_terms))
-        mlflow.log_metric("validation_accuracy", validation_accuracy)
-        mlflow.log_metric("test_accuracy", accuracy)
-        mlflow.log_metric("test_f1", f1)
+            training_dataset = mlflow.data.from_pandas(
+                frame,
+                source=str(reference_path),
+                name=dataset_version,
+                targets="label",
+            )
+            mlflow.log_input(training_dataset, context="training")
 
-        training_dataset = mlflow.data.from_pandas(
-            frame,
-            source=str(directory / "reference.csv"),
-            name=manifest["dataset"],
-            targets="label",
+            example_inputs = X_test.head(5).tolist()
+            example_predictions = model.predict(example_inputs)
+            signature = infer_signature(example_inputs, example_predictions)
+            model_info = mlflow.sklearn.log_model(
+                sk_model=model,
+                artifact_path="model",
+                signature=signature,
+                input_example=example_inputs,
+                registered_model_name=registered_model,
+            )
+            logged_model_id = getattr(model_info, "model_id", None)
+            if logged_model_id:
+                mlflow.set_tag("logged_model_id", logged_model_id)
+            mlflow.set_tag("logged_model_uri", model_info.model_uri)
+            mlflow.log_artifact(str(model_path), artifact_path="model")
+            artifact_example = X_test.head(10).to_frame(name="sentence")
+            example_path = model_directory / "input_example.csv"
+            artifact_example.to_csv(example_path, index=False)
+            mlflow.log_artifact(str(example_path), artifact_path="examples")
+            mlflow.log_artifact(str(tfidf_path), artifact_path="feature_engineering")
+            mlflow.log_artifact(str(baseline_path), artifact_path="monitoring/psi_baseline")
+            mlflow.log_artifact(str(evaluation_path), artifact_path="evaluation")
+            mlflow.log_dict(manifest, "model_manifest.json")
+            mlflow.log_dict(evaluation_report, "evaluation/evaluation_report.json")
+
+        registry_versions = mlflow.MlflowClient(tracking_uri=MLFLOW_URI).search_model_versions(
+            f"name='{registered_model}'"
         )
-
-        mlflow.log_input(training_dataset, context="training")
-
-        example_inputs = X_test.head(5).tolist()
-        example_predictions = model.predict(example_inputs)
-        
-        signature = infer_signature(
-            example_inputs,
-            example_predictions
+        registry_version = next(
+            (item.version for item in registry_versions if item.run_id == run.info.run_id),
+            None,
         )
-        
-        model_info = mlflow.sklearn.log_model(
-            sk_model=model,
-            name="model",
-            signature=signature,
-            input_example=example_inputs,
-            registered_model_name=registered_model,
-            serialization_format="skops",
-            skops_trusted_types=[
-                "app.scr.preprocessing_utils.preprocess_text"
-            ],
-            
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"MLflow logging or registration failed: {exc}",
+        ) from exc
+    if registry_version is None:
+        raise HTTPException(
+            status_code=502,
+            detail=f"MLflow did not return a registered version for {registered_model}",
         )
-
-        mlflow.set_tag("logged_model_id", model_info.model_id)
-        mlflow.set_tag("logged_model_uri", model_info.model_uri)
-
-        mlflow.log_artifact(
-            str(model_path),
-            artifact_path="model"
-        )
-        
-        artifact_example = X_test.head(10).to_frame(name="sentence")
-        example_path = model_directory / "input_example.csv"
-
-        artifact_example.to_csv(example_path, index=False)
-        mlflow.log_artifact(str(example_path),artifact_path="examples")
-                
-        mlflow.log_artifact(str(tfidf_path), artifact_path="feature_engineering")
-        mlflow.log_artifact(str(baseline_path), artifact_path="monitoring/psi_baseline")
-        mlflow.log_dict(manifest, "model_manifest.json")
-
-    registry_versions = mlflow.MlflowClient(tracking_uri=MLFLOW_URI).search_model_versions(
-        f"name='{registered_model}'"
-    )
-    registry_version = next(
-        (item.version for item in registry_versions if item.run_id == run.info.run_id),
-        None,
-    )
 
     manifest.update({
         "mlflow_experiment": "ml_work_flow_training",
@@ -861,8 +965,12 @@ def predict(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         model: Pipeline = joblib.load(model_path)
         prediction = int(model.predict([sentence])[0])
-        probabilities = model.predict_proba([sentence])[0]
-        probability = float(np.max(probabilities))
+        classifier = get_pipeline_classifier(model)
+        vectorizer = model.named_steps["tfidf"]
+        _, probabilities = classifier_probabilities(
+            classifier, vectorizer.transform([sentence])
+        )
+        probability = float(np.max(probabilities[0]))
         PREDICTIONS.labels(status="success").inc()
         return {
             "prediction": prediction,
@@ -965,7 +1073,7 @@ pre{background:#101b2e;color:#d9e8f7;padding:16px;border-radius:8px;min-height:1
 <div class="card span-4"><div class="eyebrow">Latest drift</div><div id="drift" class="value">Not evaluated</div><div id="driftInfo" class="muted">PSI threshold configured on server</div></div>
 
 <div class="card span-6"><div class="eyebrow">1. Dataset versioning</div><h2>SST-2</h2><select id="datasetChoice"><option value="sst2">Stanford SST-2</option></select><button onclick="createDataset()">Create dataset version</button><p class="muted">Creates immutable reference.csv and mutable current.csv snapshots.</p></div>
-<div class="card span-6"><div class="eyebrow">2. Model versioning</div><h2>TF-IDF + Logistic Regression</h2><button onclick="trainModel()">Train and register model</button><p class="muted">Tunes Logistic Regression, evaluates on a held-out test set, saves the fitted TF-IDF separately, and logs to MLflow.</p></div>
+<div class="card span-6"><div class="eyebrow">2. Model versioning</div><h2>Train and register a classifier</h2><select id="modelChoice"><option value="logistic_regression">Logistic Regression</option><option value="sgd_classifier">SGD Classifier</option><option value="lightgbm">LightGBM</option></select><button onclick="trainModel()">Train and register model</button><p id="modelDescription" class="muted">Trains and tunes Logistic Regression using TF-IDF features, evaluates performance, and registers the model in MLflow.</p></div>
 
 <div class="card span-12"><div class="eyebrow">3. Controlled NLP drift</div><h2>Inject text drift</h2>
 <select id="featureChoice"><option value="sentence">sentence</option></select>
@@ -989,9 +1097,11 @@ const log=document.getElementById('log');
 async function api(path,options={}){const response=await fetch(path,{headers:{'Content-Type':'application/json'},...options});const text=await response.text();let data;try{data=JSON.parse(text)}catch{data={detail:text||'Empty server response'}}if(!response.ok)throw new Error(data.detail||'Request failed');return data}
 function show(data){log.textContent='Success\n'+JSON.stringify(data,null,2);refresh()}
 async function run(fn){log.textContent='Working...';try{show(await fn())}catch(error){log.textContent='Error\n'+error.message}}
-async function refresh(){const data=await api('/api/state');const state=data.state;document.getElementById('dataset').textContent=state.active_dataset?state.active_dataset.name+'_v'+String(state.active_dataset.version).padStart(3,'0'):'None';document.getElementById('datasetInfo').textContent=state.active_dataset?state.active_dataset.description:'Create a version';document.getElementById('model').textContent=state.active_model?'model_v'+String(state.active_model.version).padStart(3,'0'):'None';document.getElementById('modelInfo').textContent=state.active_model?'Accuracy '+(state.active_model.accuracy*100).toFixed(1)+'% | F1 '+(state.active_model.f1*100).toFixed(1)+'%':'Train a model';document.getElementById('drift').textContent=state.last_evaluation?(state.last_evaluation.breach?'BREACH':'NORMAL'):'Not evaluated';const result=state.last_evaluation;const feature=result?(result.most_drifted_feature||result.most_drifted_tfidf_feature||'Unknown feature'):'';const psi=result&&Number.isFinite(Number(result.psi))?Number(result.psi).toFixed(3):'n/a';document.getElementById('driftInfo').textContent=result?'PSI '+psi+' | '+feature:'PSI threshold configured on server'}
+async function refresh(){const data=await api('/api/state');const state=data.state;document.getElementById('dataset').textContent=state.active_dataset?state.active_dataset.name+'_v'+String(state.active_dataset.version).padStart(3,'0'):'None';document.getElementById('datasetInfo').textContent=state.active_dataset?state.active_dataset.description:'Create a version';document.getElementById('model').textContent=state.active_model?'model_v'+String(state.active_model.version).padStart(3,'0'):'None';document.getElementById('modelInfo').textContent=state.active_model?(state.active_model.algorithm+' | Accuracy '+(state.active_model.accuracy*100).toFixed(1)+'% | F1 '+(state.active_model.f1*100).toFixed(1)+'%'):'Train a model';document.getElementById('drift').textContent=state.last_evaluation?(state.last_evaluation.breach?'BREACH':'NORMAL'):'Not evaluated';const result=state.last_evaluation;const feature=result?(result.most_drifted_feature||result.most_drifted_tfidf_feature||'Unknown feature'):'';const psi=result&&Number.isFinite(Number(result.psi))?Number(result.psi).toFixed(3):'n/a';document.getElementById('driftInfo').textContent=result?'PSI '+psi+' | '+feature:'PSI threshold configured on server'}
 async function createDataset(){run(()=>api('/api/datasets/version',{method:'POST',body:JSON.stringify({name:'sst2'})}))}
-async function trainModel(){run(()=>api('/api/models/train',{method:'POST',body:'{}'}))}
+const modelDescriptions={logistic_regression:'Trains and tunes Logistic Regression using TF-IDF features, evaluates performance, and registers the model in MLflow.',sgd_classifier:'Trains and tunes a linear classifier using stochastic gradient descent and TF-IDF features, evaluates performance, and registers the model in MLflow.',lightgbm:'Trains and tunes a gradient boosting classifier using TF-IDF features, evaluates performance, and registers the model in MLflow.'};
+document.getElementById('modelChoice').addEventListener('change',event=>{document.getElementById('modelDescription').textContent=modelDescriptions[event.target.value]});
+async function trainModel(){const model_type=document.getElementById('modelChoice').value;run(()=>api('/api/models/train',{method:'POST',body:JSON.stringify({model_type})}))}
 async function injectDrift(){run(()=>api('/api/drift/inject',{method:'POST',body:JSON.stringify({feature:'sentence',drift_text:document.getElementById('driftText').value,drift_ratio:Number(document.getElementById('driftRatio').value)})}))}
 async function predictSentiment(){run(()=>api('/api/predict',{method:'POST',body:JSON.stringify({sentence:document.getElementById('predictionText').value})}))}
 async function resetCurrent(){run(()=>api('/api/drift/reset',{method:'POST'}))}

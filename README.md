@@ -1,6 +1,6 @@
 # ml_work_flow
 
-This project versions the SST-2 training data, fits a TF-IDF and Logistic Regression sentiment model, and provides a FastAPI control surface with MLflow, Prometheus, and Grafana integration.
+This project versions the SST-2 training data, fits TF-IDF sentiment models with Logistic Regression, SGD Classifier, or LightGBM, and provides a FastAPI control surface with MLflow, Prometheus, and Grafana integration.
 
 ## NLP drift monitoring
 
@@ -13,7 +13,7 @@ The classifier's TF-IDF columns are model inputs; the primary monitoring feature
 - `positive_probability`: probability associated with the positive model class.
 - `predicted_sentiment`: predicted model class, monitored as a categorical distribution.
 
-The optional supplementary vocabulary analysis selects up to `TOP_DRIFT_FEATURES` Logistic Regression coefficient-important terms. It monitors document presence rather than term-value quantiles and does not influence the primary breach decision. Set `ENABLE_TFIDF_TERM_MONITORING=false` to disable it.
+The optional supplementary vocabulary analysis selects up to `TOP_DRIFT_FEATURES` terms using the classifier's coefficients or feature importances. It monitors document presence rather than term-value quantiles and does not influence the primary breach decision. Set `ENABLE_TFIDF_TERM_MONITORING=false` to disable it.
 
 ## Persistent PSI baseline
 
@@ -28,12 +28,14 @@ PSI compares feature-distribution changes; it does not directly measure classifi
 ## API workflow
 
 1. `POST /api/datasets/version` with `{"name":"sst2"}`.
-2. `POST /api/models/train` to train, register, and save the model and baseline.
+2. `POST /api/models/train` with `{"model_type":"logistic_regression"}`, `{"model_type":"sgd_classifier"}`, or `{"model_type":"lightgbm"}` to train, register, and save the model and baseline. An empty request continues to default to Logistic Regression.
 3. Optionally `POST /api/drift/inject` with `{"feature":"sentence","drift_text":"excellent wonderful","drift_ratio":0.3}`.
 4. `POST /api/drift/evaluate` to compare the current dataset with the persisted baseline.
 5. `POST /api/drift/reset` to restore `current.csv` from `reference.csv`.
 
 `GET /api/state`, `POST /api/predict`, `POST /api/grafana/dashboard`, `/metrics`, and `/report` remain available. Evaluation results include per-feature PSI, KS and p-values where numerical, Jensen-Shannon divergence, the model/baseline versions, primary breach counts, and supplementary vocabulary drift.
+
+The Step 2 model selector uses the active dataset's immutable `reference.csv` snapshot. Each algorithm is tuned using a stratified five-fold search over a shared train/validation/test split and its fitted TF-IDF vectorizer is saved separately. Model versions are registered as `sentiment_logistic_regression`, `sentiment_sgd_classifier`, or `sentiment_lightgbm`. Test accuracy, weighted precision/recall/F1, confusion matrix, and ROC-AUC when available are recorded in the model manifest and MLflow run.
 
 ## Prometheus and Grafana
 
@@ -62,5 +64,7 @@ To restart the already-built stack without rebuilding:
 ```powershell
 docker compose restart
 ```
+
+To train from the dashboard, create a dataset version in Step 1, select an algorithm in Step 2, and click **Train and register model**. The default is Logistic Regression; the same algorithms can be selected through `POST /api/models/train` using the `model_type` request property.
 
 The control service mounts `./workspace` persistently; MLflow, Prometheus, and Grafana retain their existing named volumes.

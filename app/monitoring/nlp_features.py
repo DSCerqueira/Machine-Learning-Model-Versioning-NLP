@@ -9,6 +9,8 @@ import pandas as pd
 from scipy import sparse
 from sklearn.pipeline import Pipeline
 
+from app.modeling import classifier_probabilities, get_pipeline_classifier
+
 
 def _as_texts(texts: Any) -> list[str]:
     if isinstance(texts, pd.Series):
@@ -28,11 +30,11 @@ def extract_nlp_monitoring_features(
     positive_label: Any = 1,
     selected_terms: Iterable[dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
-    """Extract interpretable NLP features from the fitted TF-IDF/LR pipeline."""
-    if not isinstance(model, Pipeline) or not {"tfidf", "lr"}.issubset(model.named_steps):
-        raise ValueError("model must be a fitted Pipeline with 'tfidf' and 'lr' steps")
+    """Extract interpretable NLP features from a fitted TF-IDF classifier pipeline."""
+    if not isinstance(model, Pipeline) or "tfidf" not in model.named_steps:
+        raise ValueError("model must be a fitted Pipeline with a 'tfidf' step")
     vectorizer = model.named_steps["tfidf"]
-    classifier = model.named_steps["lr"]
+    classifier = get_pipeline_classifier(model)
     if not hasattr(vectorizer, "vocabulary_") or not hasattr(classifier, "classes_"):
         raise ValueError("model Pipeline must be fitted before monitoring")
 
@@ -50,9 +52,7 @@ def extract_nlp_monitoring_features(
     tfidf_matrix = vectorizer.transform(text_values)
     tfidf_nonzero_counts = np.asarray(tfidf_matrix.getnnz(axis=1)).reshape(-1)
     predicted = classifier.predict(tfidf_matrix)
-    probabilities = classifier.predict_proba(tfidf_matrix)
-
-    classes = np.asarray(classifier.classes_)
+    classes, probabilities = classifier_probabilities(classifier, tfidf_matrix)
     positive_matches = np.flatnonzero(classes == positive_label)
     if len(positive_matches) != 1:
         raise ValueError(f"positive_label {positive_label!r} is not a model class")
@@ -79,16 +79,18 @@ def extract_nlp_monitoring_features(
 
 
 def important_tfidf_indices(model: Pipeline, top_n: int) -> np.ndarray:
-    """Return indices of TF-IDF terms with largest absolute LR coefficients."""
+    """Return the most important TF-IDF terms for a fitted classifier."""
     if top_n < 0:
         raise ValueError("top_n must be nonnegative")
-    if not isinstance(model, Pipeline) or "lr" not in model.named_steps:
-        raise ValueError("model must be a Pipeline containing an 'lr' step")
-    classifier = model.named_steps["lr"]
-    if not hasattr(classifier, "coef_"):
+    if not isinstance(model, Pipeline) or "tfidf" not in model.named_steps:
+        raise ValueError("model must be a Pipeline containing a 'tfidf' step")
+    classifier = get_pipeline_classifier(model)
+    if hasattr(classifier, "coef_"):
+        importance = np.max(np.abs(np.asarray(classifier.coef_)), axis=0)
+    elif hasattr(classifier, "feature_importances_"):
+        importance = np.asarray(classifier.feature_importances_)
+    else:
         raise ValueError("model classifier must be fitted before selecting terms")
-    coefficients = np.asarray(classifier.coef_)
-    importance = np.max(np.abs(coefficients), axis=0)
     count = min(top_n, importance.size)
     return np.argsort(importance)[-count:][::-1] if count else np.array([], dtype=int)
 
@@ -102,8 +104,9 @@ def extract_selected_tfidf_presence(
     terms = list(selected_terms)
     if not terms:
         return pd.DataFrame(index=range(len(_as_texts(texts))))
-    if not isinstance(model, Pipeline) or not {"tfidf", "lr"}.issubset(model.named_steps):
-        raise ValueError("model must be a fitted Pipeline with 'tfidf' and 'lr' steps")
+    if not isinstance(model, Pipeline) or "tfidf" not in model.named_steps:
+        raise ValueError("model must be a fitted Pipeline with a 'tfidf' step")
+    get_pipeline_classifier(model)
     vectorizer = model.named_steps["tfidf"]
     text_values = _as_texts(texts)
     if not hasattr(vectorizer, "vocabulary_"):
