@@ -35,9 +35,9 @@ services:
       - --artifacts-destination
       - /mlflow/artifacts
       - --allowed-hosts
-      - "mlflow:5000,localhost:5000,127.0.0.1:5000,10.0.0.146,10.0.0.146:5000,${SERVER_IP:-10.0.0.226},${SERVER_IP:-10.0.0.226}:5000"
+      - "mlflow:5000,localhost:5000,127.0.0.1:5000,${SERVER_IP}:5000"
       - --cors-allowed-origins
-      - "http://localhost:5000,http://127.0.0.1:5000,http://10.0.0.146:5000,http://${SERVER_IP:-10.0.0.226}:5000"
+      - "http://localhost:5000,http://127.0.0.1:5000,http://${SERVER_IP}:5000"
     volumes:
       - mlflow-data:/mlflow
     ports:
