@@ -94,8 +94,8 @@ KS_METRIC = Gauge("ml_drift_ks_statistic", "KS statistic", ["feature"])
 JS_METRIC = Gauge("ml_drift_js_divergence", "JS divergence", ["feature"])
 DRIFT_BREACH = Gauge("ml_drift_breach", "1 when PSI exceeds its threshold")
 QUALITY_PASS = Gauge("ml_quality_pass", "1 when the latest data quality gate passed")
-MODEL_ACCURACY = Gauge("ml_model_accuracy", "Accuracy of the active model",["run_name", "model_type","Latest version"])
-MODEL_F1 = Gauge("ml_model_f1", "F1 score of the active model",["run_name", "model_type","Latest version"])
+MODEL_ACCURACY = Gauge("ml_model_accuracy", "Accuracy of the active model",["run_name", "Models","model_type"])
+MODEL_F1 = Gauge("ml_model_f1", "F1 score of the active model",["run_name", "Models", "model_type"])
 NLP_BASELINE_VERSION = Gauge("ml_nlp_baseline_version", "Active NLP PSI baseline version")
 NLP_BREACHED_FEATURES = Gauge(
     "ml_nlp_breached_features", "Number of breached primary NLP features"
