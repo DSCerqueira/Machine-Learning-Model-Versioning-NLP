@@ -93,6 +93,10 @@ PSI_METRIC = Gauge("ml_drift_psi", "Population Stability Index", ["feature"])
 KS_METRIC = Gauge("ml_drift_ks_statistic", "KS statistic", ["feature"])
 JS_METRIC = Gauge("ml_drift_js_divergence", "JS divergence", ["feature"])
 DRIFT_BREACH = Gauge("ml_drift_breach", "1 when PSI exceeds its threshold")
+DRIFT_RATIO = Gauge(
+    "ml_drift_breach_ratio",
+    "Ratio of monitored primary features exceeding the PSI threshold"
+)
 QUALITY_PASS = Gauge("ml_quality_pass", "1 when the latest data quality gate passed")
 MODEL_ACCURACY = Gauge("ml_model_accuracy", "Accuracy of the active model",["run_name", "Models","model_type"])
 MODEL_F1 = Gauge("ml_model_f1", "F1 score of the active model",["run_name", "Models", "model_type"])
@@ -351,6 +355,7 @@ def create_dataset_version(payload: dict[str, str]) -> dict[str, Any]:
     MODEL_ACCURACY.clear()
     MODEL_F1.clear()
     DRIFT_BREACH.set(0)
+    DRIFT_RATIO.set(0)
     QUALITY_PASS.set(0)
     NLP_BASELINE_VERSION.set(0)
     NLP_BREACHED_FEATURES.set(0)
@@ -690,6 +695,7 @@ def train_model(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     MODEL_ACCURACY.labels(**metric_labels).set(accuracy)
     MODEL_F1.labels(**metric_labels).set(f1)
     DRIFT_BREACH.set(0)
+    DRIFT_RATIO.set(0)
     NLP_BASELINE_VERSION.set(int(baseline["schema_version"]))
     NLP_BREACHED_FEATURES.set(0)
     for metric in (PSI_METRIC, KS_METRIC, JS_METRIC):
@@ -755,6 +761,7 @@ def reset_current_data() -> dict[str, str]:
     state.update({"stage": "dataset_ready", "drift": None, "last_evaluation": None})
     write_state(state)
     DRIFT_BREACH.set(0)
+    DRIFT_RATIO.set(0)
     QUALITY_PASS.set(0)
     NLP_BREACHED_FEATURES.set(0)
     for metric in (PSI_METRIC, KS_METRIC, JS_METRIC):
@@ -836,6 +843,7 @@ def evaluate_drift() -> dict[str, Any]:
         if feature_result["ks"] is not None:
             KS_METRIC.labels(feature=feature_name).set(feature_result["ks"])
     DRIFT_BREACH.set(int(evaluation["breach"]))
+    DRIFT_RATIO.set(float(evaluation["breach_ratio"]))
     NLP_BASELINE_VERSION.set(int(baseline["schema_version"]))
     NLP_BREACHED_FEATURES.set(int(evaluation["breached_features"]))
 
@@ -939,7 +947,7 @@ def reset_workspace() -> dict[str, str]:
     STATE_PATH.unlink(missing_ok=True)
     ensure_dirs()
     for metric in (
-        DATASET_VERSION, MODEL_VERSION, DRIFT_BREACH, QUALITY_PASS,
+        DATASET_VERSION, MODEL_VERSION, DRIFT_BREACH, DRIFT_RATIO, QUALITY_PASS,
         NLP_BASELINE_VERSION, NLP_BREACHED_FEATURES,
     ):
         metric.set(0)
